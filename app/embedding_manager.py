@@ -4,7 +4,7 @@ Embedding utilities for vector database operations using transformers.
 import os
 import logging
 import numpy as np
-from typing import List
+from typing import List, Optional
 from dotenv import load_dotenv
 
 from langchain_core.embeddings import Embeddings
@@ -87,6 +87,7 @@ class EmbeddingManager:
                 raise fallback_error
                 
         self.persist_directory = persist_directory
+        self._db_cache = {}  # Cache for database connections
     
     def store_documents(
         self, 
@@ -103,13 +104,21 @@ class EmbeddingManager:
         Returns:
             The ChromaDB instance.
         """
-        db = Chroma.from_documents(
-            documents=documents,
-            embedding=self.embeddings,
-            persist_directory=self.persist_directory,
-            collection_name=collection_name
-        )
-        return db
+        # Check if we have an existing database to add to
+        try:
+            existing_db = self.load_vector_store(collection_name)
+            # Add documents to existing database
+            existing_db.add_documents(documents)
+            return existing_db
+        except:
+            # Create new database if loading fails
+            db = Chroma.from_documents(
+                documents=documents,
+                embedding=self.embeddings,
+                persist_directory=self.persist_directory,
+                collection_name=collection_name
+            )
+            return db
     
     def load_vector_store(
         self, 
@@ -124,27 +133,69 @@ class EmbeddingManager:
         Returns:
             The ChromaDB instance.
         """
-        return Chroma(
+        # Check cache first
+        cache_key = f"{self.persist_directory}_{collection_name}"
+        if cache_key in self._db_cache:
+            return self._db_cache[cache_key]
+        
+        db = Chroma(
             persist_directory=self.persist_directory,
             embedding_function=self.embeddings,
             collection_name=collection_name
         )
+        
+        # Cache the database connection
+        self._db_cache[cache_key] = db
+        return db
     
     def search_documents(
         self, 
         query: str, 
-        db: Chroma, 
-        k: int = 4
+        db: Optional[Chroma] = None, 
+        k: int = 4,
+        collection_name: str = "pdf_documents"
     ) -> List[Document]:
         """
         Search for relevant documents.
         
         Args:
             query: The search query.
-            db: The vector database.
+            db: The vector database (optional, will load if not provided).
             k: Number of documents to retrieve.
+            collection_name: The collection name (used if db is None).
             
         Returns:
             List of relevant documents.
         """
+        if db is None:
+            db = self.load_vector_store(collection_name)
+        
         return db.similarity_search(query, k=k)
+    
+    def close_connections(self):
+        """Close all database connections and clear cache."""
+        try:
+            # Clear the cache
+            for db in self._db_cache.values():
+                try:
+                    # Try to close the connection if the method exists
+                    if hasattr(db, '_client') and hasattr(db._client, 'reset'):
+                        db._client.reset()
+                except:
+                    pass
+            
+            self._db_cache.clear()
+            
+            # Force garbage collection
+            import gc
+            gc.collect()
+            
+        except Exception as e:
+            logger.warning(f"Error closing database connections: {str(e)}")
+    
+    def __del__(self):
+        """Destructor to ensure connections are closed."""
+        try:
+            self.close_connections()
+        except:
+            pass

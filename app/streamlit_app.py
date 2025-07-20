@@ -5,6 +5,7 @@ import os
 import sys
 import tempfile
 import streamlit as st
+import shutil
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -44,14 +45,81 @@ def check_model_cached(model_id, filename="config.json"):
         return False
 
 
+def clear_all_data():
+    """Clear all embeddings and uploaded PDFs."""
+    try:
+        # First, clear the orchestrator to close any database connections
+        if st.session_state.orchestrator is not None:
+            try:
+                # Try to delete the orchestrator and its connections
+                del st.session_state.orchestrator
+                st.session_state.orchestrator = None
+            except:
+                pass
+        
+        # Force garbage collection to help release file handles
+        import gc
+        gc.collect()
+        
+        # Small delay to allow file handles to be released
+        import time
+        time.sleep(0.5)
+        
+        # Clear ChromaDB directory
+        if CHROMA_DIR.exists():
+            try:
+                shutil.rmtree(CHROMA_DIR)
+            except PermissionError:
+                # If we can't delete the folder, try to delete individual files
+                for root, dirs, files in os.walk(CHROMA_DIR, topdown=False):
+                    for file in files:
+                        try:
+                            os.remove(os.path.join(root, file))
+                        except:
+                            pass
+                    for dir in dirs:
+                        try:
+                            os.rmdir(os.path.join(root, dir))
+                        except:
+                            pass
+                # Try to remove the main directory
+                try:
+                    os.rmdir(CHROMA_DIR)
+                except:
+                    pass
+            
+            # Recreate the directory
+            CHROMA_DIR.mkdir(exist_ok=True)
+        
+        # Clear uploads directory
+        if UPLOADS_DIR.exists():
+            shutil.rmtree(UPLOADS_DIR)
+            UPLOADS_DIR.mkdir(exist_ok=True)
+        
+        # Clear session state
+        st.session_state.orchestrator = None
+        st.session_state.uploaded_pdfs = []
+        
+        return True
+    except Exception as e:
+        st.error(f"Error clearing data: {str(e)}")
+        # Even if there's an error, still clear session state
+        st.session_state.orchestrator = None
+        st.session_state.uploaded_pdfs = []
+        return False
+
+
 def initialize_session_state():
     """Initialize session state variables."""
     if "orchestrator" not in st.session_state:
         st.session_state.orchestrator = None
-    if "pdf_uploaded" not in st.session_state:
-        st.session_state.pdf_uploaded = False
-    if "pdf_name" not in st.session_state:
-        st.session_state.pdf_name = None
+    if "uploaded_pdfs" not in st.session_state:
+        st.session_state.uploaded_pdfs = []
+    
+    # Clear data on app startup
+    if "app_initialized" not in st.session_state:
+        clear_all_data()
+        st.session_state.app_initialized = True
 
 
 def main():
@@ -61,20 +129,21 @@ def main():
     # App header
     st.title("📚 PDF Q&A with RAG")
     st.markdown("""
-    Upload a PDF and ask questions about its contents.
+    Upload PDFs and ask questions about their contents.
     The system uses LangGraph, LangChain, and HuggingFace to provide answers.
     """)
     
-    # Offline mode information
-    if os.environ.get("TRANSFORMERS_OFFLINE") == "1" or not os.environ.get("HF_HUB_ENABLE_HF_TRANSFER"):
-        st.warning("⚠️ Running in system-wide offline mode. Models must be pre-downloaded.")
-        st.info("""
-        To run in online mode, set these environment variables:
-        ```
-        set TRANSFORMERS_OFFLINE=0
-        set HF_HUB_ENABLE_HF_TRANSFER=1
-        ```
-        """)
+    # Clear Data Button
+    col1, col2 = st.columns([3, 1])
+    with col2:
+        if st.button("🗑️ Clear All Data", type="secondary"):
+            with st.spinner("Clearing all data..."):
+                if clear_all_data():
+                    st.success("All data cleared successfully!")
+                    # Force a rerun to refresh the UI
+                    st.rerun()
+                else:
+                    st.warning("Some files might still be in use. Please restart the app if needed.")
     
     # Sidebar for model configuration
     with st.sidebar:
@@ -82,7 +151,7 @@ def main():
         
         st.markdown("---")
         
-        # Default models information with improved design
+        # Default models information
         with st.container():
             st.markdown("#### Models in Use")
             st.markdown("""
@@ -92,21 +161,10 @@ def main():
             </div>
             """, unsafe_allow_html=True)
         
-        # Hidden but used variable for number of documents to retrieve
-        top_k = 4
-        
-        # Offline mode option
-        local_files_only = st.checkbox(
-            "Offline Mode (Use local models only)", 
-            value=False,
-            help="Enable to use only locally cached models without connecting to Hugging Face servers"
-        )
-        
         # Add a button to pre-download the default model
         if st.button("Download Default Models for Offline Use"):
             with st.status("Downloading models for offline use..."):
                 try:
-                    from huggingface_hub import snapshot_download
                     from sentence_transformers import SentenceTransformer
                     
                     # Download the embedding model
@@ -119,43 +177,51 @@ def main():
                     st.error(f"Error downloading models: {str(e)}")
                     st.info("Try again with a valid Hugging Face token.")
     
+    # Display uploaded PDFs
+    if st.session_state.uploaded_pdfs:
+        st.subheader("📄 Uploaded PDFs")
+        for pdf_name in st.session_state.uploaded_pdfs:
+            st.write(f"• {pdf_name}")
+        st.markdown("---")
+    
     # File uploader
     uploaded_file = st.file_uploader("Upload a PDF document", type="pdf")
     
     # Process the uploaded PDF
-    if uploaded_file and not st.session_state.pdf_uploaded:
-        with st.spinner("Processing PDF..."):
-            # Save the uploaded file
-            temp_dir = tempfile.TemporaryDirectory()
-            temp_path = os.path.join(temp_dir.name, uploaded_file.name)
-            with open(temp_path, "wb") as f:
-                f.write(uploaded_file.getvalue())
-            
-            # Initialize the orchestrator
-            orchestrator = RAGOrchestrator(
-                persist_directory=str(CHROMA_DIR),
-                local_files_only=local_files_only,
-                top_k=4  # Using fixed value instead of UI slider
-            )
-            
-            # Process the PDF
-            orchestrator.process_pdf(temp_path)
-            
-            # Update session state
-            st.session_state.orchestrator = orchestrator
-            st.session_state.pdf_uploaded = True
-            st.session_state.pdf_name = uploaded_file.name
-            
-        st.success(f"PDF '{uploaded_file.name}' processed successfully!")
+    if uploaded_file:
+        # Check if this PDF is already uploaded
+        if uploaded_file.name not in st.session_state.uploaded_pdfs:
+            with st.spinner(f"Processing PDF: {uploaded_file.name}..."):
+                # Save the uploaded file
+                pdf_path = UPLOADS_DIR / uploaded_file.name
+                with open(pdf_path, "wb") as f:
+                    f.write(uploaded_file.getvalue())
+                
+                # Initialize orchestrator if not exists
+                if st.session_state.orchestrator is None:
+                    st.session_state.orchestrator = RAGOrchestrator(
+                        persist_directory=str(CHROMA_DIR),
+                        local_files_only=False,
+                        top_k=4
+                    )
+                
+                # Process the PDF
+                st.session_state.orchestrator.process_pdf(str(pdf_path))
+                
+                # Add to uploaded PDFs list
+                st.session_state.uploaded_pdfs.append(uploaded_file.name)
+                
+            st.success(f"PDF '{uploaded_file.name}' processed and added successfully!")
+            st.rerun()
     
     # Q&A interface
-    if st.session_state.pdf_uploaded:
-        st.subheader(f"Ask questions about '{st.session_state.pdf_name}'")
+    if st.session_state.uploaded_pdfs:
+        st.subheader("❓ Ask Questions")
         
         # Question input
         question = st.text_input("Your question:")
         
-        if st.button("Get Answer"):
+        if st.button("Get Answer", type="primary"):
             if question:
                 with st.spinner("Generating answer..."):
                     answer = st.session_state.orchestrator.answer_question(question)
@@ -165,6 +231,8 @@ def main():
                 st.markdown(answer)
             else:
                 st.warning("Please enter a question.")
+    else:
+        st.info("Upload a PDF to start asking questions!")
     
     # Footer
     st.markdown("---")
