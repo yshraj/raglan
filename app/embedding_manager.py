@@ -1,6 +1,10 @@
 """
 Embedding utilities for vector database operations using transformers.
 """
+__import__('pysqlite3')
+import sys
+sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
+
 import os
 import logging
 import numpy as np
