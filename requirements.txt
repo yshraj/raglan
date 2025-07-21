@@ -14,3 +14,4 @@ requests>=2.31.0
 python-dotenv>=1.0.0
 tqdm>=4.66.1
 hf_transfer
+pysqlite3-binary
