@@ -162,20 +162,20 @@ def main():
             """, unsafe_allow_html=True)
         
         # Add a button to pre-download the default model
-        if st.button("Download Default Models for Offline Use"):
-            with st.status("Downloading models for offline use..."):
-                try:
-                    from sentence_transformers import SentenceTransformer
+        # if st.button("Download Default Models for Offline Use"):
+        #     with st.status("Downloading models for offline use..."):
+        #         try:
+        #             from sentence_transformers import SentenceTransformer
                     
-                    # Download the embedding model
-                    embedding_model = "sentence-transformers/all-MiniLM-L6-v2"
-                    st.write(f"Downloading embedding model: {embedding_model}")
-                    SentenceTransformer(embedding_model)
+        #             # Download the embedding model
+        #             embedding_model = "sentence-transformers/all-MiniLM-L6-v2"
+        #             st.write(f"Downloading embedding model: {embedding_model}")
+        #             SentenceTransformer(embedding_model)
                     
-                    st.success("✅ Default embedding model downloaded successfully for offline use!")
-                except Exception as e:
-                    st.error(f"Error downloading models: {str(e)}")
-                    st.info("Try again with a valid Hugging Face token.")
+        #             st.success("✅ Default embedding model downloaded successfully for offline use!")
+        #         except Exception as e:
+        #             st.error(f"Error downloading models: {str(e)}")
+        #             st.info("Try again with a valid Hugging Face token.")
     
     # Display uploaded PDFs
     if st.session_state.uploaded_pdfs:
