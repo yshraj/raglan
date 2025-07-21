@@ -1,5 +1,6 @@
 """
 Embedding utilities for vector database operations using transformers.
+Fixed version with better error handling and database management.
 """
 __import__('pysqlite3')
 import sys
@@ -13,6 +14,8 @@ from typing import List, Optional
 from dotenv import load_dotenv
 import time
 import shutil
+import tempfile
+import sqlite3
 
 from langchain_core.embeddings import Embeddings
 from langchain_community.vectorstores import Chroma
@@ -41,11 +44,14 @@ def ensure_directory_permissions(directory_path):
             for root, dirs, files in os.walk(directory_path):
                 for dir_name in dirs:
                     dir_path = os.path.join(root, dir_name)
-                    os.chmod(dir_path, 0o755)
+                    try:
+                        os.chmod(dir_path, 0o755)
+                    except Exception as e:
+                        logger.warning(f"Could not set permissions for directory {dir_path}: {e}")
                 for file in files:
                     file_path = os.path.join(root, file)
                     try:
-                        os.chmod(file_path, 0o644)
+                        os.chmod(file_path, 0o666)  # More permissive for files
                     except Exception as e:
                         logger.warning(f"Could not set permissions for {file_path}: {e}")
             
@@ -54,6 +60,27 @@ def ensure_directory_permissions(directory_path):
     except Exception as e:
         logger.error(f"Error setting directory permissions: {e}")
         raise
+
+
+def test_sqlite_write_permissions(db_path):
+    """Test if we can write to SQLite database in the given path."""
+    test_db_path = os.path.join(db_path, "test_write.db")
+    try:
+        conn = sqlite3.connect(test_db_path)
+        conn.execute("CREATE TABLE IF NOT EXISTS test (id INTEGER)")
+        conn.execute("INSERT INTO test (id) VALUES (1)")
+        conn.commit()
+        conn.close()
+        os.remove(test_db_path)
+        return True
+    except Exception as e:
+        logger.warning(f"SQLite write test failed: {e}")
+        if os.path.exists(test_db_path):
+            try:
+                os.remove(test_db_path)
+            except:
+                pass
+        return False
 
 
 class TransformerEmbeddings(Embeddings):
@@ -92,7 +119,8 @@ class EmbeddingManager:
         self, 
         model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
         persist_directory: str = "./data/chroma_db",
-        local_files_only: bool = False
+        local_files_only: bool = False,
+        use_temp_fallback: bool = True
     ):
         """
         Initialize the embedding manager.
@@ -101,6 +129,7 @@ class EmbeddingManager:
             model_name: The embedding model to use.
             persist_directory: Directory to store the vector database.
             local_files_only: Whether to use only local model files (offline mode).
+            use_temp_fallback: Whether to use temporary directory as fallback.
         """
         # Fallback to a simpler embedding model that's likely to be cached
         fallback_model = "distilbert-base-uncased"
@@ -122,32 +151,104 @@ class EmbeddingManager:
                 logger.error(f"Failed to load fallback embedding model: {str(fallback_error)}")
                 raise fallback_error
                 
-        self.persist_directory = persist_directory
+        self.original_persist_directory = persist_directory
+        self.use_temp_fallback = use_temp_fallback
         self._db_cache = {}  # Cache for database connections
         
-        # Ensure directory exists and has proper permissions
-        ensure_directory_permissions(self.persist_directory)
+        # Try to setup the persist directory
+        self.persist_directory = self._setup_persist_directory()
+    
+    def _setup_persist_directory(self):
+        """Setup the persist directory with proper permissions or fallback to temp."""
+        try:
+            # Try the original directory first
+            ensure_directory_permissions(self.original_persist_directory)
+            
+            # Test if we can actually write SQLite databases here
+            if test_sqlite_write_permissions(self.original_persist_directory):
+                logger.info(f"Using original persist directory: {self.original_persist_directory}")
+                return self.original_persist_directory
+            else:
+                raise Exception("Cannot write SQLite databases to original directory")
+                
+        except Exception as e:
+            logger.warning(f"Cannot use original persist directory: {e}")
+            
+            if self.use_temp_fallback:
+                # Fallback to a temporary directory
+                temp_dir = tempfile.mkdtemp(prefix="chroma_db_")
+                logger.warning(f"Falling back to temporary directory: {temp_dir}")
+                return temp_dir
+            else:
+                raise e
     
     def _cleanup_database_if_corrupted(self, collection_name: str):
         """Clean up potentially corrupted database files."""
         try:
-            collection_path = os.path.join(self.persist_directory, f"{collection_name}.sqlite3")
-            if os.path.exists(collection_path):
-                # Check if file is corrupted or has permission issues
-                try:
-                    # Try to get file stats
-                    stat_info = os.stat(collection_path)
-                    if stat_info.st_size == 0:
-                        logger.warning(f"Database file is empty, removing: {collection_path}")
-                        os.remove(collection_path)
-                except Exception as e:
-                    logger.warning(f"Database file may be corrupted, removing: {collection_path}")
-                    try:
-                        os.remove(collection_path)
-                    except:
-                        pass
+            # Look for various ChromaDB files that might exist
+            patterns = [
+                f"chroma.sqlite3",
+                f"{collection_name}.sqlite3",
+                f"*.sqlite3"
+            ]
+            
+            for pattern in patterns:
+                if '*' in pattern:
+                    import glob
+                    files = glob.glob(os.path.join(self.persist_directory, pattern))
+                else:
+                    files = [os.path.join(self.persist_directory, pattern)]
+                
+                for file_path in files:
+                    if os.path.exists(file_path):
+                        try:
+                            # Check if file is corrupted or has permission issues
+                            stat_info = os.stat(file_path)
+                            if stat_info.st_size == 0:
+                                logger.warning(f"Database file is empty, removing: {file_path}")
+                                os.remove(file_path)
+                            else:
+                                # Try to open and check the database
+                                conn = sqlite3.connect(file_path)
+                                conn.execute("SELECT 1")
+                                conn.close()
+                        except Exception as e:
+                            logger.warning(f"Database file may be corrupted, removing: {file_path}")
+                            try:
+                                os.remove(file_path)
+                            except:
+                                pass
+                                
         except Exception as e:
             logger.warning(f"Error during database cleanup: {e}")
+    
+    def _create_fresh_directory(self):
+        """Create a fresh directory for the database."""
+        backup_dir = f"{self.original_persist_directory}_backup_{int(time.time())}"
+        
+        # Backup existing directory if it exists
+        if os.path.exists(self.persist_directory):
+            try:
+                shutil.move(self.persist_directory, backup_dir)
+                logger.warning(f"Moved corrupted database to {backup_dir}")
+            except Exception as e:
+                logger.warning(f"Could not backup directory: {e}")
+                # Try to remove it instead
+                try:
+                    shutil.rmtree(self.persist_directory)
+                except Exception as rm_error:
+                    logger.error(f"Could not remove corrupted directory: {rm_error}")
+        
+        # Create fresh directory
+        if self.use_temp_fallback and not test_sqlite_write_permissions(os.path.dirname(self.original_persist_directory)):
+            # Use temp directory
+            self.persist_directory = tempfile.mkdtemp(prefix="chroma_db_fresh_")
+            logger.info(f"Created fresh temp directory: {self.persist_directory}")
+        else:
+            # Use original path
+            self.persist_directory = self.original_persist_directory
+            ensure_directory_permissions(self.persist_directory)
+            logger.info(f"Created fresh directory: {self.persist_directory}")
     
     def store_documents(
         self, 
@@ -166,28 +267,41 @@ class EmbeddingManager:
         Returns:
             The ChromaDB instance.
         """
+        last_error = None
+        
         for attempt in range(max_retries):
             try:
+                logger.info(f"Attempting to store documents (attempt {attempt + 1}/{max_retries})")
+                
                 # Clear any cached connections
                 self._clear_cache()
                 
                 # Ensure permissions are correct
                 ensure_directory_permissions(self.persist_directory)
                 
-                # Try to load existing database first
-                try:
-                    existing_db = self.load_vector_store(collection_name)
-                    # Test if we can write to it
-                    existing_db.add_documents([Document(page_content="test", metadata={})])
-                    # If successful, remove the test document and add real ones
-                    existing_db.delete(where={"page_content": "test"})
-                    existing_db.add_documents(documents)
-                    logger.info(f"Added {len(documents)} documents to existing collection")
-                    return existing_db
-                except Exception as load_error:
-                    logger.warning(f"Could not load existing database: {load_error}")
-                    # Clean up potentially corrupted files
-                    self._cleanup_database_if_corrupted(collection_name)
+                # For the first attempt, try to load existing database
+                if attempt == 0:
+                    try:
+                        existing_db = self.load_vector_store(collection_name)
+                        # Test if we can write to it with a simple operation
+                        test_doc = Document(page_content="connection_test", metadata={"test": True})
+                        existing_db.add_documents([test_doc])
+                        
+                        # If successful, remove the test document and add real ones
+                        try:
+                            existing_db.delete(where={"test": True})
+                        except:
+                            # Some versions might not support delete, that's ok
+                            pass
+                        
+                        existing_db.add_documents(documents)
+                        logger.info(f"Successfully added {len(documents)} documents to existing collection")
+                        return existing_db
+                        
+                    except Exception as load_error:
+                        logger.warning(f"Could not load/write to existing database: {load_error}")
+                        # Clean up potentially corrupted files
+                        self._cleanup_database_if_corrupted(collection_name)
                 
                 # Create new database
                 logger.info(f"Creating new ChromaDB collection: {collection_name}")
@@ -204,22 +318,23 @@ class EmbeddingManager:
                 return db
                 
             except Exception as e:
+                last_error = e
                 logger.error(f"Attempt {attempt + 1} failed: {str(e)}")
                 
-                if "readonly database" in str(e).lower():
+                if "readonly database" in str(e).lower() or "database is locked" in str(e).lower():
                     # Try to fix permissions and clean up
                     self._cleanup_database_if_corrupted(collection_name)
-                    ensure_directory_permissions(self.persist_directory)
+                    
+                    # If this isn't the last attempt, try creating a fresh directory
+                    if attempt < max_retries - 1:
+                        self._create_fresh_directory()
+                    
                     time.sleep(1)  # Brief pause between attempts
                 
-                if attempt == max_retries - 1:
-                    # Last attempt failed, try with a fresh directory
-                    backup_dir = f"{self.persist_directory}_backup_{int(time.time())}"
-                    if os.path.exists(self.persist_directory):
-                        shutil.move(self.persist_directory, backup_dir)
-                        logger.warning(f"Moved corrupted database to {backup_dir}")
-                    
-                    ensure_directory_permissions(self.persist_directory)
+                elif attempt == max_retries - 1:
+                    # Last attempt - try one more time with a completely fresh setup
+                    logger.warning("Final attempt with fresh directory")
+                    self._create_fresh_directory()
                     
                     try:
                         db = Chroma.from_documents(
@@ -232,9 +347,9 @@ class EmbeddingManager:
                         return db
                     except Exception as final_error:
                         logger.error(f"Final attempt failed: {final_error}")
-                        raise final_error
+                        last_error = final_error
         
-        raise Exception(f"Failed to store documents after {max_retries} attempts")
+        raise Exception(f"Failed to store documents after {max_retries} attempts. Last error: {last_error}")
     
     def load_vector_store(
         self, 
@@ -293,20 +408,19 @@ class EmbeddingManager:
     
     def _clear_cache(self):
         """Clear the database cache."""
+        for db in self._db_cache.values():
+            try:
+                # Try to close the connection if the method exists
+                if hasattr(db, '_client') and hasattr(db._client, 'reset'):
+                    db._client.reset()
+            except Exception as e:
+                logger.debug(f"Error closing cached connection: {e}")
+        
         self._db_cache.clear()
     
     def close_connections(self):
         """Close all database connections and clear cache."""
         try:
-            # Clear the cache
-            for db in self._db_cache.values():
-                try:
-                    # Try to close the connection if the method exists
-                    if hasattr(db, '_client') and hasattr(db._client, 'reset'):
-                        db._client.reset()
-                except Exception as e:
-                    logger.debug(f"Error closing individual connection: {e}")
-            
             self._clear_cache()
             
             # Force garbage collection
@@ -315,6 +429,10 @@ class EmbeddingManager:
             
         except Exception as e:
             logger.warning(f"Error closing database connections: {str(e)}")
+    
+    def get_persist_directory(self):
+        """Get the current persist directory being used."""
+        return self.persist_directory
     
     def __del__(self):
         """Destructor to ensure connections are closed."""
